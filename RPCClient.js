@@ -1,4 +1,4 @@
-// Import fetch for making HTTP requests
+//RPCClient.js
 const fetch = require('node-fetch-commonjs');
 
 // Define the class for Verus RPC interaction
@@ -9,38 +9,43 @@ class VerusRPC {
         this.url = url;
     }
 
-    // Helper function to call the Verus JSON-RPC
-    async callRPC(method, params = []) {
-        const body = {
-            jsonrpc: '1.0',
-            id: 'verus',
-            method,
-            params
-        };
+	// Helper function to call the Verus JSON-RPC
+	async callRPC(method, params = []) {
+		const body = {
+			jsonrpc: '1.0',
+			id: 'verus',
+			method,
+			params
+		};
 
-        // Set up headers and authorization
-        const headers = {
-            'Content-Type': 'application/json',
-            'Authorization': 'Basic ' + Buffer.from(`${this.rpcUser}:${this.rpcPassword}`).toString('base64')
-        };
+		// Set up headers and authorization
+		const headers = {
+			'Content-Type': 'application/json',
+			'Authorization': 'Basic ' + Buffer.from(`${this.rpcUser}:${this.rpcPassword}`).toString('base64')
+		};
 
-        try {
-            const response = await fetch(this.url, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(body)
-            });
+		try {
+			const response = await fetch(this.url, {
+				method: 'POST',
+				headers,
+				body: JSON.stringify(body)
+			});
 
-            const result = await response.json();
-            if (result.error) {
-                throw new Error(result.error.message);
-            }
-            return result.result;
-        } catch (error) {
-            console.error('RPC call error:', error.message);
-            throw error;
-        }
-    }
+			// Log the raw response text
+			const rawResponse = await response.text();  // Read as text
+
+			// Check if the response is valid JSON
+			const result = JSON.parse(rawResponse);  // Parse the raw response manually
+			if (result.error) {
+				throw new Error(result.error.message);
+			}
+			return result.result;
+		} catch (error) {
+			console.error('RPC call error:', error);
+			throw error;
+		}
+	}
+
 
     // Method to get the block template
     async getBlockTemplate() {

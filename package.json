@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "big-integer": "^1.6.52",
     "node-fetch": "^3.3.2",
     "node-fetch-commonjs": "^3.3.2"
   }

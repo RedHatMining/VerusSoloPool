@@ -36,7 +36,7 @@ class StratumServer {
     });
 
     this.server.listen(this.port, this.host, () => {
-      console.log(`Stratum server started on ${this.host}:${this.port}`);
+      return
     });
   }
 
