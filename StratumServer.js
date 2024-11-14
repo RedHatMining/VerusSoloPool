@@ -1,7 +1,7 @@
 const net = require('net');
 
 class StratumServer {
-  constructor(port, host = '10.0.0.77') {
+  constructor(port, host = '10.0.0.76') {
     this.port = port;
     this.host = host;
     this.clients = [];

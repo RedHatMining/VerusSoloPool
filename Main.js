@@ -1,299 +1,368 @@
 const StratumServer = require('./StratumServer');
 const RPCClient = require('./RPCClient');
 const crypto = require('crypto');
+const events = require('events');
 
 const port = 5041;
-const rpcHost = "http://10.0.0.151:27486/";
+const rpcHost = "http://10.0.0.186:27486/";
 const rpcUser = "node";
 const rpcPass = "1234";
 
-const server = new StratumServer(port);
-const rpc = new RPCClient(rpcUser, rpcPass, rpcHost);
-const users = new Map();
-let currentJob = null;
+// Configuration
+const DIFFICULTY_TARGET_SHARES = 22;
+const DIFFICULTY_RETARGET_TIME = 60;
+const MIN_DIFFICULTY = 5000;
+const MAX_DIFFICULTY = 1000000;
+const VARDIFF_TIME_BUFFER = 4;
 
-const getTimestamp = () => new Date().toISOString();
-const reverseHex = hex => hex.match(/.{2}/g).reverse().join('');
+class MiningPool extends events.EventEmitter {
+    constructor() {
+        super();
+        this.server = new StratumServer(port);
+        this.rpc = new RPCClient(rpcUser, rpcPass, rpcHost);
+        this.users = new Map();
+        this.jobs = new Map();
+        this.currentBlockTemplate = null;
 
-const log = (message, type = 'info') => {
-    console.log(`${getTimestamp()} | ${type.toUpperCase()} | ${message}`);
-};
-
-const calculateMerkleRoot = (hashes) => {
-    if (!Array.isArray(hashes) || hashes.length === 0) {
-        throw new Error('Invalid hashes array provided for merkle root calculation');
+        this.initializeServer();
     }
-    if (hashes.length === 1) return hashes[0];
 
-    const newHashes = [];
-    for (let i = 0; i < hashes.length; i += 2) {
-        const hashPair = hashes[i] + (hashes[i + 1] || hashes[i]);
-        newHashes.push(crypto.createHash('sha256').update(hashPair).digest('hex'));
+    createMinerInstance(socket) {
+        return {
+            socket,
+            difficulty: MIN_DIFFICULTY,
+            validShares: 0,
+            invalidShares: 0,
+            lastShareTime: Date.now(),
+            submissions: [],
+            connected: Date.now(),
+            authorized: false,
+            username: null
+        };
     }
-    return calculateMerkleRoot(newHashes);
-};
 
-const generateJobId = () => Math.floor(Math.random() * 0xFFFFFFF).toString(16).padStart(7, '0');
+    generateJobId() {
+        return crypto.randomBytes(4).toString('hex');
+    }
 
-const generateExtraNonce = () => {
-    const characters = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    const randomValues = crypto.randomBytes(4); 
-    return Array.from(randomValues)
-        .map(byte => characters[byte % characters.length])
-        .join('');
-};
+    async createJob(blockTemplate, cleanJobs = true) {
+        const jobId = this.generateJobId();
+        const merkleRoot = this.calculateMerkleRoot([
+            blockTemplate.coinbasetxn.hash,
+            ...blockTemplate.transactions.map(tx => tx.hash)
+        ]);
 
-const fetchBlockTemplate = async (retryCount = 3) => {
-    try {
-        const blockTemplate = await rpc.getBlockTemplate();
-        if (!blockTemplate || typeof blockTemplate !== 'object') {
-            throw new Error('Invalid block template response');
+        const job = {
+            id: jobId,
+            height: blockTemplate.height,
+            previousBlockHash: blockTemplate.previousblockhash,
+            coinbase1: blockTemplate.coinbasetxn.data,
+            merkleRoot,
+            version: blockTemplate.version,
+            bits: blockTemplate.bits,
+            target: blockTemplate.target,
+            curTime: blockTemplate.curtime,
+            finalsaplingroot: blockTemplate.finalsaplingroothash,
+            cleanJobs,
+            submissions: new Set()
+        };
+
+        this.jobs.set(jobId, job);
+        return job;
+    }
+
+    adjustMinerDifficulty(miner) {
+        const now = Date.now();
+        const timeElapsed = (now - miner.lastShareTime) / 1000;
+        if (timeElapsed < DIFFICULTY_RETARGET_TIME - VARDIFF_TIME_BUFFER) return;
+
+        const sharesPerMin = (miner.validShares * 60) / timeElapsed;
+        let newDifficulty = miner.difficulty;
+
+        if (sharesPerMin < DIFFICULTY_TARGET_SHARES - 1) {
+            newDifficulty = Math.max(MIN_DIFFICULTY, miner.difficulty * 0.8);
+        } else if (sharesPerMin > DIFFICULTY_TARGET_SHARES + 1) {
+            newDifficulty = Math.min(MAX_DIFFICULTY, miner.difficulty * 1.2);
         }
-        return blockTemplate;
-    } catch (error) {
-        if (retryCount > 0) {
-            log(`Error fetching block template: ${error.message}. Retrying... (${retryCount} attempts left)`, 'warn');
-            return await fetchBlockTemplate(retryCount - 1);
+
+        if (newDifficulty !== miner.difficulty) {
+            miner.difficulty = newDifficulty;
+            this.sendDifficultyUpdate(miner);
+        }
+
+        miner.validShares = 0;
+        miner.lastShareTime = now;
+    }
+
+    async sendDifficultyUpdate(miner) {
+        // Convert difficulty to a 256-bit hex target
+        const target = this.encodeDifficulty(miner.difficulty);
+
+        const message = {
+            id: null,
+            method: 'mining.set_difficulty',
+            params: [target]
+        };
+
+        await this.server.send(miner.socket, message);
+    }
+
+    async encodeDifficulty(difficulty) {
+        // Maximum possible target for difficulty 1 is v
+        const maxTarget = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
+
+        // Calculate target based on the difficulty (inverse relationship)
+        const target = maxTarget / BigInt(difficulty);
+
+        // Convert target to a 256-bit hexadecimal string
+        const targetHex = target.toString(16).padStart(64, '0');
+        console.log(`${targetHex}`);
+        return targetHex;
+    }
+
+    async sendJob(miner, job, cleanJobs = false) {
+        const message = {
+            id: null,
+            method: 'mining.notify',
+            params: [
+                job.id,
+                job.version.toString(16).padStart(8, '0'),
+                this.reverseHex(job.previousBlockHash),
+                job.merkleRoot,
+                job.finalsaplingroot,
+                this.reverseHex(job.curTime.toString(16).padStart(8, '0')),
+                this.reverseHex(job.bits),
+                cleanJobs,
+                job.coinbase1
+            ]
+        };
+        await this.server.send(miner.socket, message);
+    }
+
+    async handleBlockNotify(blockhash) {
+        try {
+            const blockTemplate = await this.rpc.callRPC("getblocktemplate", []);
+            if (blockTemplate === this.currentBlockTemplate) {
+                return;
+            }
+
+            this.currentBlockTemplate = blockTemplate;
+            const job = await this.createJob(blockTemplate, true);
+
+            for (const [_, miner] of this.users) {
+                await this.sendJob(miner, job, true);
+            }
+
+            this.log(`New block detected: ${blockhash}, height: ${blockTemplate.height}`);
+        } catch (error) {
+            this.log(`Error processing block notification: ${error.message}`, 'error');
+        }
+    }
+
+    async handleAuthorize(socket, message) {
+        const minerKey = `${socket.remoteAddress}:${socket.remotePort}`;
+        const minerInstance = this.users.get(minerKey);
+
+        if (!minerInstance) {
+            this.log(`Authorization attempt from unknown miner: ${minerKey}`, 'warning');
+            return;
+        }
+
+        const [username, password] = message.params;
+
+        const authorized = true;
+
+        const response = {
+            id: message.id,
+            result: authorized,
+            error: null
+        };
+
+        if (authorized) {
+            minerInstance.authorized = true;
+            minerInstance.username = username;
+            this.log(`Miner ${username} (${minerKey}) authorized successfully`);
+            //send first job on connection
+            await this.sendDifficultyUpdate(minerInstance);
+            const blockTemplate = await this.rpc.callRPC("getblocktemplate", []);
+            const job = await this.createJob(blockTemplate, true);
+            await this.sendJob(minerInstance.socket, job, true);
+
         } else {
-            log(`Failed to fetch block template after multiple attempts: ${error.message}`, 'error');
-            throw error;
+            this.log(`Failed authorization attempt from ${minerKey}`, 'warning');
+        }
+
+        await this.server.send(socket, response);
+    }
+
+    async handleSubmit(socket, message) {
+        const minerKey = `${socket.remoteAddress}:${socket.remotePort}`;
+        const minerInstance = this.users.get(minerKey);
+
+        if (!minerInstance || !minerInstance.authorized) {
+            this.log(`Unauthorized submit from ${minerKey}`, 'warning');
+            return;
+        }
+
+        const [workerName, jobId, timeHex, nonceStr, solHex] = message.params;
+        const job = this.jobs.get(jobId);
+
+        if (!job) {
+            await this.server.send(socket, {
+                id: message.id,
+                result: null,
+                error: [21, 'Job not found', null]
+            });
+            return;
+        }
+
+        // Check for duplicate submission
+        const submissionKey = `${jobId}:${nonceStr}:${solHex}`;
+        if (job.submissions.has(submissionKey)) {
+            await this.server.send(socket, {
+                id: message.id,
+                result: null,
+                error: [22, 'Duplicate share', null]
+            });
+            return;
+        }
+
+        job.submissions.add(submissionKey);
+
+        try {
+            // Submit share to node for verification
+            const shareResponse = await this.rpc.callRPC('submitblock', {
+                jobId,
+                time: timeHex,
+                nonce: nonceStr,
+                solution: solHex
+            });
+
+            if (shareResponse.valid) {
+                minerInstance.validShares++;
+                this.adjustMinerDifficulty(minerInstance);
+
+                // If share response indicates it's also a valid block
+                if (shareResponse.isBlock) {
+                    try {
+                        await this.rpc.submitBlock(shareResponse.blockHex);
+                        this.log(`Block found by ${minerInstance.username}!`, 'success');
+                    } catch (error) {
+                        this.log(`Error submitting block: ${error.message}`, 'error');
+                    }
+                }
+
+                await this.server.send(socket, {
+                    id: message.id,
+                    result: true,
+                    error: null
+                });
+
+                this.log(`Valid share from ${minerInstance.username} (diff: ${minerInstance.difficulty})`);
+            } else {
+                minerInstance.invalidShares++;
+                await this.server.send(socket, {
+                    id: message.id,
+                    result: null,
+                    error: [20, 'Invalid share', null]
+                });
+
+                this.log(`Invalid share from ${minerInstance.username}`, 'warning');
+            }
+        } catch (error) {
+            this.log(`Error processing share: ${error.message}`, 'error');
+            await this.server.send(socket, {
+                id: message.id,
+                result: null,
+                error: [20, 'Share verification error', null]
+            });
         }
     }
-};
 
-const submitBlock = async (block) => {
-    try {
-        const response = await rpc.submitBlock(block);
-        if (!response || response.error) {
-            throw new Error(`Failed to submit block: ${response.error || 'Unknown error'}`);
+    initializeServer() {
+        this.server.on('connection', (socket) => this.handleNewConnection(socket));
+        this.server.on('mining.subscribe', (socket, message) => this.handleSubscribe(socket, message));
+        this.server.on('mining.authorize', (socket, message) => this.handleAuthorize(socket, message));
+        this.server.on('mining.submit', (socket, message) => this.handleSubmit(socket, message));
+        this.server.on('mining.extranonce.subscribe', () => {})
+
+        this.server.start();
+        this.log(`Mining Pool Server started on port ${port}`);
+    }
+
+    async handleNewConnection(socket) {
+        const miner = `${socket.remoteAddress}:${socket.remotePort}`;
+        const minerInstance = this.createMinerInstance(socket);
+        this.users.set(miner, minerInstance);
+        this.log(`New miner connected: ${miner}`);
+
+        socket.on('error', (error) => {
+            this.log(`Socket error from ${miner}: ${error.message}`, 'error');
+            this.users.delete(miner);
+        });
+
+        socket.on('close', () => {
+            this.log(`Connection closed: ${miner}`, 'info');
+            this.users.delete(miner);
+        });
+    }
+
+    async handleSubscribe(socket, message) {
+        const minerKey = `${socket.remoteAddress}:${socket.remotePort}`;
+        let minerInstance = this.users.get(minerKey);
+
+        if (!minerInstance) {
+            minerInstance = this.createMinerInstance(socket);
+            this.users.set(minerKey, minerInstance);
         }
-        return response;
-    } catch (error) {
-        log(`Error submitting block: ${error.message}`, 'error');
-        throw error;
+
+        const response = {
+            id: message.id,
+            result: [
+                [
+                    ["mining.set_difficulty", `${minerKey}_diff`],
+                    ["mining.notify", `${minerKey}_notify`]
+                ]
+            ],
+            error: null
+        };
+
+        await this.server.send(socket, response);
+    }
+
+    getTimestamp() {
+        return new Date().toISOString();
+    }
+
+    reverseHex(hex) {
+        return hex.match(/.{2}/g).reverse().join('');
+    }
+
+    log(message, type = 'info') {
+        const timestamp = this.getTimestamp();
+        console.log(`${timestamp} | ${type.toUpperCase()} | ${message}`);
+    }
+
+    calculateMerkleRoot(hashes) {
+        if (!Array.isArray(hashes) || hashes.length === 0) {
+            throw new Error('Invalid hashes array provided for merkle root calculation');
+        }
+        if (hashes.length === 1) return hashes[0];
+
+        const newHashes = [];
+        for (let i = 0; i < hashes.length; i += 2) {
+            const hashPair = hashes[i] + (hashes[i + 1] || hashes[i]);
+            newHashes.push(crypto.createHash('sha256').update(hashPair).digest('hex'));
+        }
+        return this.calculateMerkleRoot(newHashes);
     }
 }
 
-const sendWork = async (socket, miner, isNewJob = false) => {
-    try {
-        if (!currentJob) {
-            log(`No active job for miner ${miner}`, 'error');
-            return;
-        }
-        
-        const blockTemplate = currentJob.template;
-        const jobId = currentJob.id;
-        
-        const targetMessage = {
-            jsonrpc: '2.0',
-            method: 'mining.set_target',
-            params: [reverseHex(blockTemplate.target)],
-            id: null
-        };
-        
-        await server.send(socket, targetMessage);
+// Initialize and export the pool
+const pool = new MiningPool();
 
-        const notifyMessage = {
-            jsonrpc: '2.0',
-            method: 'mining.notify',
-            params: [
-                jobId,
-                blockTemplate.version.toString(16).padStart(8, '0'),
-                reverseHex(blockTemplate.previousblockhash),
-                calculateMerkleRoot([blockTemplate.coinbasetxn.hash, ...blockTemplate.transactions.map(tx => tx.hash)]).slice(0, 64),
-                blockTemplate.finalsaplingroothash,
-                reverseHex(blockTemplate.curtime.toString(16).padStart(8, '0')),
-                reverseHex(blockTemplate.bits),
-                true,
-                blockTemplate.coinbasetxn.data
-            ],
-            id: null
-        };
-
-        await server.send(socket, notifyMessage);
-		if (!isNewJob) {
-        log(`Sent existing job to miner ${miner} - Job ID: ${jobId} - Target: ${reverseHex(blockTemplate.target)}`);
-		}
-    } catch (error) {
-        log(`Error sending work to miner ${miner}: ${error.message}`, 'error');
-    }
+// Export method for block notifications
+module.exports = {
+    notifyBlock: (blockhash) => pool.handleBlockNotify(blockhash),
+    pool
 };
-
-const handleNewConnection = async (socket) => {
-    const miner = `${socket.remoteAddress}:${socket.remotePort}`;
-    users.set(miner, socket);
-    log(`New miner connected: ${miner}`);
-
-    try {
-        if (currentJob) {
-            await sendWork(socket, miner, false);
-        } else {
-            await updateJob();
-        }
-    } catch (error) {
-        log(`Error handling new connection for miner ${miner}: ${error.message}`, 'error');
-    }
-
-    socket.on('error', (error) => {
-        log(`Socket error from ${miner}: ${error.message}`, 'error');
-        users.delete(miner);
-    });
-
-    socket.on('close', () => {
-        log(`Connection closed by miner ${miner}`, 'info');
-        users.delete(miner);
-    });
-};
-
-const handleSubscribe = async (socket, message) => {
-    const miner = `${socket.remoteAddress}:${socket.remotePort}`;
-    const extranonce1 = generateExtraNonce();
-    
-    log(`Miner ${miner} subscribed`);
-
-    const response = {
-        result: [extranonce1, crypto.randomBytes(4).toString('hex')],
-        id: message.id,
-        error: null
-    };
-
-    try {
-        await server.send(socket, response);
-        await handleNewConnection(socket);
-    } catch (error) {
-        log(`Error handling subscription for miner ${miner}: ${error.message}`, 'error');
-    }
-};
-
-const handleAuthorize = async (socket, message) => {
-    const miner = `${socket.remoteAddress}:${socket.remotePort}`;
-    const username = message.params[0];
-
-    log(`Miner ${miner} authorized as ${username}`);
-    const response = { result: true, id: message.id, error: null };
-
-    try {
-        await server.send(socket, response);
-        await sendWelcomeMessage(socket);
-        await updateJob();
-    } catch (error) {
-        log(`Error authorizing miner ${miner}: ${error.message}`, 'error');
-    }
-};
-
-const sendWelcomeMessage = async (socket) => {
-    const welcomeMessage = {
-        id: null,
-        method: 'client.show_message',
-        params: ['Welcome to Zarina\'s Solo Mining Pool']
-    };
-
-    try {
-        await server.send(socket, welcomeMessage);
-    } catch (error) {
-        log(`Error sending welcome message: ${error.message}`, 'error');
-    }
-};
-
-const handleSubmit = async (socket, message) => {
-    const miner = `${socket.remoteAddress}:${socket.remotePort}`;
-    const jobData = currentJob;
-
-    if (!jobData) {
-        log(`No active job for miner ${miner}`, 'error');
-        return;
-    }
-
-    // Extract values from the message
-    const timeHex = message.params[2];
-    const nonceStr = message.params[3];
-    const solHex = message.params[4];
-
-    try {
-        // Build each part of the block header as hex strings
-        const nVersion = jobData.template.version.toString(16).padStart(8, '0');                        // nVersion
-        const hashPrevBlock = reverseHex(jobData.template.previousblockhash);                            // hashPrevBlock
-        const merkleRoot = reverseHex(calculateMerkleRoot([jobData.template.coinbasetxn.hash, ...jobData.template.transactions.map(tx => tx.hash)]).slice(0, 64)); // hashMerkleRoot
-        //const hashReserved = reverseHex(jobData.template.finalsaplingroothash || jobData.template.hashBlockCommitments); // hashReserved / hashBlockCommitments
-        const nTime = reverseHex(timeHex.padStart(8, '0'));                                              // nTime
-        const nBits = reverseHex(jobData.template.bits.padStart(8, '0'));                                // nBits
-        const nNonce = nonceStr.padStart(8, '0');                                                        // nNonce
-        const solutionSize = '05d0';                                                                     // solutionSize (1344 in little-endian)
-        const solution = solHex;                                                                         // solution
-
-        // Concatenate the parts to form the complete block header as a hex string
-        const blockHeader = nVersion + hashPrevBlock + merkleRoot + nTime + nBits + nNonce + solutionSize + solution;
-
-        // Print out the block header for debugging
-        log(`Block header for miner ${miner}: ${blockHeader}`);
-
-        // Submit the block
-        const result = await submitBlock(blockHeader);
-        log(`Block submitted by ${miner}: ${result}`);
-    } catch (error) {
-        log(`Error submitting share for miner ${miner}: ${error.message}`, 'error');
-    }
-
-    const response = { "result": true, "error": null, "id": message.id };
-    await server.send(socket, response);
-    log(`Share submitted by ${miner}`);
-};
-
-const updateJob = async () => {
-    try {
-        const blockTemplate = await fetchBlockTemplate();
-        let miners = 0;
-
-        if (currentJob &&
-            currentJob.template.previousblockhash === blockTemplate.previousblockhash &&
-            currentJob.target === reverseHex(blockTemplate.target)) {
-            return; // No update needed; existing job can be reused
-        }
-
-        const jobId = generateJobId();
-        currentJob = {
-            id: jobId,
-            template: blockTemplate,
-            target: reverseHex(blockTemplate.target),
-            timestamp: getTimestamp()
-        };
-        log(`New job created with Job ID: ${jobId}`);
-
-        for (const [miner, socket] of users) {
-            await sendWork(socket, miner, true);
-            miners += 1;
-        }
-        
-        if (miners > 0) {
-            log(`Sent new job to ${miners} miner(s) - Job ID: ${currentJob.id}`, 'info');
-        }
-    } catch (error) {
-        log(`Error updating job: ${error.message}`, 'error');
-    }
-};
-
-server.on('connection', (socket) => {
-    handleNewConnection(socket);
-
-    socket.on('error', (error) => {
-        const miner = `${socket.remoteAddress}:${socket.remotePort}`;
-        log(`Socket error from ${miner}: ${error.message}`, 'error');
-        users.delete(miner);
-    });
-
-    socket.on('close', () => {
-        const miner = `${socket.remoteAddress}:${socket.remotePort}`;
-        log(`Connection closed: ${miner}`, 'info');
-        users.delete(miner);
-    });
-});
-
-server.on('mining.subscribe', (socket, message) => handleSubscribe(socket, message));
-server.on('mining.authorize', (socket, message) => handleAuthorize(socket, message));
-server.on('mining.submit', (socket, message) => handleSubmit(socket, message));
-server.on('mining.extranonce.subscribe', () => {});
-
-server.start();
-log(`Zarina's Solo Mining Pool Server started on port ${port}`);
-
-setInterval(() => updateJob(), 100); // Every 0.1 seconds
